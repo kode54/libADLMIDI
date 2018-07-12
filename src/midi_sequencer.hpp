@@ -708,6 +708,20 @@ private:
      */
     bool parseRMI(FileAndMemReader &fr);
 
+    /**
+     * @brief Load file as Human Machine Interfaces MIDI file
+     * @param fr Context with opened file
+     * @return true on successful load
+     */
+    bool parseHMI(FileAndMemReader &fr);
+
+    /**
+     * @brief Load file as Human Machine Interfaces MIDI file
+     * @param fr Context with opened file
+     * @return true on successful load
+     */
+    bool parseHMP(FileAndMemReader &fr);
+
 #ifndef BWMIDI_DISABLE_MUS_SUPPORT
     /**
      * @brief Load file as DMX MUS file (Doom)

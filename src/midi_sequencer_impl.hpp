@@ -1924,6 +1924,18 @@ bool BW_MidiSequencer::loadMIDI(FileAndMemReader &fr)
         return parseRMI(fr);
     }
 
+    if(std::memcmp(headerBuf, "HMIMIDIP", 8) == 0)
+    {
+        fr.seek(0, FileAndMemReader::SET);
+        return parseHMP(fr);
+    }
+
+    if(std::memcmp(headerBuf, "HMI-MIDI", 8) == 0)
+    {
+        fr.seek(0, FileAndMemReader::SET);
+        return parseHMI(fr);
+    }
+
     if(std::memcmp(headerBuf, "GMF\x1", 4) == 0)
     {
         fr.seek(0, FileAndMemReader::SET);
@@ -2426,6 +2438,231 @@ bool BW_MidiSequencer::parseRMI(FileAndMemReader &fr)
     fr.seek(6l, FileAndMemReader::CUR);
     return parseSMF(fr);
 }
+
+#define HMP_NEW_DATE    "013195"
+#define HMI_SONG_MAGIC  "HMI-MIDISONG061595"
+#define HMI_TRACK_MAGIC "HMI-MIDITRACK"
+
+// In song header
+#define HMI_DIVISION_OFFSET			0xD4
+#define HMI_TRACK_COUNT_OFFSET		0xE4
+#define HMI_TRACK_DIR_PTR_OFFSET	0xE8
+
+#define HMP_DIVISION_OFFSET			0x38
+#define HMP_TRACK_COUNT_OFFSET		0x30
+#define HMP_DESIGNATIONS_OFFSET		0x94
+#define HMP_TRACK_OFFSET_0			0x308	// original HMP
+#define HMP_TRACK_OFFSET_1			0x388	// newer HMP
+
+// In track header
+#define HMITRACK_DATA_PTR_OFFSET	0x57
+#define HMITRACK_DESIGNATION_OFFSET	0x99
+
+#define HMPTRACK_LEN_OFFSET			4
+#define HMPTRACK_DESIGNATION_OFFSET	8
+#define HMPTRACK_MIDI_DATA_OFFSET	12
+
+#define NUM_HMP_DESIGNATIONS		5
+#define NUM_HMI_DESIGNATIONS		8
+
+// MIDI device types for designation
+#define HMI_DEV_GM					0xA000	// Generic General MIDI (not a real device)
+#define HMI_DEV_MPU401				0xA001	// MPU-401, Roland Sound Canvas, Ensoniq SoundScape, Rolad RAP-10
+#define HMI_DEV_OPL2				0xA002	// SoundBlaster (Pro), ESS AudioDrive
+#define HMI_DEV_MT32				0xA004	// MT-32
+#define HMI_DEV_SBAWE32				0xA008	// SoundBlaster AWE32
+#define HMI_DEV_OPL3				0xA009	// SoundBlaster 16, Microsoft Sound System, Pro Audio Spectrum 16
+#define HMI_DEV_GUS					0xA00A	// Gravis UltraSound, Gravis UltraSound Max/Ace
+
+static uint32_t readVarLenHMI(FileAndMemReader &fr)
+{
+    uint32_t time = 0, t = 0x80;
+    while ((t & 0x80) && !fr.eof())
+    {
+        t = static_cast<uint8_t>(fr.getc());
+        time = (time << 7) | (t & 127);
+    }
+    return time;
+}
+
+static uint32_t readVarLenHMP(FileAndMemReader &fr)
+{
+    uint32_t time = 0;
+    uint8_t t = 0;
+    int off = 0;
+
+    while (!(t & 0x80) && !fr.eof())
+    {
+        t = static_cast<uint8_t>(fr.getc());
+        time |= (t & 127) << off;
+        off += 7;
+    }
+    return time;
+}
+
+static uint64_t hmi_readLE(FileAndMemReader &fr, size_t bytes, bool *ok = NULL)
+{
+    char buff[8];
+    std::memset(buff, 0, 8);
+    size_t got = fr.read(buff, 1, bytes);
+    if(ok)
+        *ok = (got == bytes);
+    return readLEint(buff, bytes);
+}
+
+bool BW_MidiSequencer::parseHMI(FileAndMemReader &fr)
+{
+    const size_t headerSize = 18;
+    char headerBuf[headerSize] = "";
+    size_t fsize = 0;
+    size_t fileLength = fr.fileSize();
+    size_t deltaTicks = 192, trackCount = 0;
+    uint32_t track_dir = 0;
+    bool ok = false;
+    std::vector<std::vector<uint8_t> > rawTrackData;
+    typedef uint32_t (*ReadVarLenFn)(FileAndMemReader &);
+
+    //ReadVarLenFn readHmiVarLen = readVarLenHMI;
+
+    fsize = fr.read(headerBuf, 1, headerSize);
+    if(fsize < headerSize)
+    {
+        m_errorString = "Unexpected end of file at header!\n";
+        return false;
+    }
+
+    if(std::memcmp(headerBuf, "HMI-MIDISONG061595", 18) != 0)
+    {
+        m_errorString = fr.fileName() + ": Invalid format, HMI-MIDISONG061595 signature is not found!\n";
+        return false;
+    }
+
+    fr.seek(HMI_TRACK_COUNT_OFFSET, FileAndMemReader::SET);
+    trackCount = static_cast<size_t>(hmi_readLE(fr, 2, &ok));
+    if(!ok)
+    {
+        m_errorString = "Unexpected end of file at header! (Fail to read track count)\n";
+        return false;
+    }
+
+    rawTrackData.clear();
+    rawTrackData.resize(trackCount, std::vector<uint8_t>());
+
+    fr.seek(HMI_DIVISION_OFFSET, FileAndMemReader::SET);
+    deltaTicks = static_cast<size_t>(hmi_readLE(fr, 2, &ok)) << 2;
+    if(!ok)
+    {
+        m_errorString = "Unexpected end of file at header! (Fail to read tempo division)\n";
+        return false;
+    }
+    m_invDeltaTicks = fraction<uint64_t>(1, 4000000l * static_cast<uint64_t>(deltaTicks));
+    m_tempo         = fraction<uint64_t>(1,            static_cast<uint64_t>(deltaTicks) * 4);
+
+    fr.seek(HMI_TRACK_DIR_PTR_OFFSET, FileAndMemReader::SET);
+    track_dir = static_cast<uint32_t>(hmi_readLE(fr, 4, &ok));
+    if(!ok)
+    {
+        m_errorString = "Unexpected end of file at header! (Fail to read track dir ptr offset)\n";
+        return false;
+    }
+
+    static const unsigned char EndTag[4] = {0xFF, 0x2F, 0x00, 0x00};
+    //! Real count of tracks. Empty tracks will be cuted down
+    size_t tkReal = 0;
+    for(size_t tk = 0; tk < trackCount; ++tk)
+    {
+        int32_t start;
+        int32_t tracklen, datastart;
+
+        fr.seek(track_dir + tk * 4, FileAndMemReader::SET);
+        start = static_cast<int32_t>(hmi_readLE(fr, 4));
+        if(start > fileLength - HMITRACK_DESIGNATION_OFFSET - 4)
+            continue;// Track is incomplete.
+
+        fr.seek(start, FileAndMemReader::SET);
+        fsize = fr.read(headerBuf, 1, 18);
+        if(std::memcmp(headerBuf, HMI_TRACK_MAGIC, 13) != 0)
+            continue;
+
+        // The track ends where the next one begins. If this is the
+        // last track, then it ends at the end of the file.
+        if(tk == trackCount - 1)
+        {
+            tracklen = fileLength - start;
+        }
+        else
+        {
+            fr.seek(track_dir + tk * 4 + 4, FileAndMemReader::SET);
+            tracklen = static_cast<int32_t>(hmi_readLE(fr, 4)) - start;
+        }
+
+        // Clamp incomplete tracks to the end of the file.
+        tracklen = std::min(tracklen, static_cast<int32_t>(fileLength) - start);
+        if(tracklen <= 0)
+            continue;
+
+        // Offset to actual MIDI events.
+        fr.seek(start + HMITRACK_DATA_PTR_OFFSET, FileAndMemReader::SET);
+        datastart = static_cast<int32_t>(hmi_readLE(fr, 4));
+        tracklen -= datastart;
+        if(tracklen <= 0)
+            continue;
+
+        // Read track data
+        fr.seek(start + datastart, FileAndMemReader::SET);
+        rawTrackData[tkReal].resize(tracklen);
+        fsize = fr.read(&rawTrackData[tkReal][0], 1, tracklen);
+        if(fsize < static_cast<size_t>(tracklen))
+        {
+            m_errorString = fr.fileName() + ": Unexpected file ending while getting raw track data!\n";
+            return false;
+        }
+
+        // Add missing end of track event
+        rawTrackData[tkReal].insert(rawTrackData[tkReal].end(), EndTag + 0, EndTag + 4);
+        tkReal++;
+    }
+
+    rawTrackData.resize(tkReal);
+
+    // Build new MIDI events table
+    if(!buildSmfTrackData(rawTrackData))
+    {
+        m_errorString = fr.fileName() + ": MIDI data parsing error has occouped!\n" + m_parsingErrorsString;
+        return false;
+    }
+
+    return true;
+}
+
+
+bool BW_MidiSequencer::parseHMP(FileAndMemReader &fr)
+{
+    const size_t headerSize = 8;
+    char headerBuf[headerSize] = "";
+    size_t fsize = 0;
+    size_t deltaTicks = 192, trackCount = 0;
+    std::vector<std::vector<uint8_t> > rawTrackData;
+    typedef uint32_t (*ReadVarLenFn)(FileAndMemReader &);
+
+    ReadVarLenFn readHmiVarLen = readVarLenHMP;
+
+    fsize = fr.read(headerBuf, 1, headerSize);
+    if(fsize < headerSize)
+    {
+        m_errorString = "Unexpected end of file at header!\n";
+        return false;
+    }
+
+    if(std::memcmp(headerBuf, "HMIMIDIP", 8) != 0)
+    {
+        m_errorString = fr.fileName() + ": Invalid format, HMIMIDIP signature is not found!\n";
+        return false;
+    }
+
+    return true;
+}
+
 
 #ifndef BWMIDI_DISABLE_MUS_SUPPORT
 bool BW_MidiSequencer::parseMUS(FileAndMemReader &fr)
