@@ -1581,7 +1581,7 @@ void PhaseGenerator::setFrequency(int f_number, int block, int mult) {
 	// This frequency formula is derived from the following equation:
 	// f_number = baseFrequency * pow(2,19) / OPL_SAMPLE_RATE / pow(2,block-1);        
 	double baseFrequency = 
-		f_number * pow(2.0, block-1) * OPL_SAMPLE_RATE / pow(2.0,19);
+		f_number * pow(2.0, (double)block-1) * OPL_SAMPLE_RATE / pow(2.0,19.0);
 	double operatorFrequency = baseFrequency*OperatorDataStruct::multTable[mult];
 	
 	// phase goes from 0 to 1 at 
